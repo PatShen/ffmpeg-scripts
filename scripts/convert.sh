@@ -1,0 +1,152 @@
+#!/bin/bash
+# ============================================================
+#  convert.sh —— macOS 批量视频转 MP4（高兼容性）
+#
+#  用法:
+#    ./convert.sh <输入目录> <输出目录>
+#  示例:
+#    ./convert.sh ~/Movies/input ~/Movies/output
+#
+#  字幕:
+#    MP4 内嵌字幕按流复制（-c:s copy），内容与时间轴保持原样；
+#    若字幕无法写入 MP4，则回退为无字幕版本并给出提示。
+#
+#  依赖:
+#    brew install ffmpeg
+# ============================================================
+
+# 兼容 Homebrew 安装的 ffmpeg（Apple Silicon / Intel）
+export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+
+# ---------- 0. 参数 ----------
+if [ $# -ne 2 ]; then
+    echo "用法: $0 <输入目录> <输出目录>"
+    echo "示例: $0 ~/Movies/input ~/Movies/output"
+    exit 1
+fi
+
+INPUT_DIR="${1%/}"
+OUTPUT_DIR="${2%/}"
+
+RESULT_FILE="$(mktemp -t mp4conv)"
+DIALOG_FILE="$(mktemp -t mp4conv)"
+trap 'rm -f "$RESULT_FILE" "$DIALOG_FILE"' EXIT
+
+# ---------- 1. 环境检查 ----------
+if ! command -v ffmpeg >/dev/null 2>&1; then
+    osascript -e 'display dialog "未检测到 ffmpeg，请先安装：brew install ffmpeg" with title "错误" buttons {"好的"} default button 1 with icon stop'
+    exit 1
+fi
+
+if [ ! -d "$INPUT_DIR" ]; then
+    osascript -e "display dialog \"输入目录不存在：\n$INPUT_DIR\" with title \"错误\" buttons {\"好的\"} default button 1 with icon stop"
+    exit 1
+fi
+
+mkdir -p "$OUTPUT_DIR"
+
+# ---------- 转码函数 ----------
+# $1=输入文件  $2=输出文件  $3=1 复制字幕 / 0 不带字幕
+encode_file() {
+    local in="$1" out="$2" with_subs="$3"
+    local sub_args=()
+
+    if [ "$with_subs" -eq 1 ]; then
+        sub_args=(-map 0:s? -c:s copy)
+    fi
+
+    ffmpeg -nostdin -hide_banner -loglevel error -stats -y -i "$in" \
+         -map 0:v:0 -map 0:a:0? "${sub_args[@]}" \
+         -vf "scale=trunc(iw/2)*2:trunc(ih/2)*2" \
+         -c:v libx264 -preset medium -crf 20 -profile:v high -level 4.1 \
+         -pix_fmt yuv420p \
+         -c:a aac -b:a 192k -ac 2 \
+         "$out"
+}
+
+# ---------- 2. 扫描视频文件（仅第一层，不递归） ----------
+EXTS=(mp4 m4v mkv avi mov wmv flv webm mpg mpeg mpe m2v ts m2ts mts 3gp 3g2 rm rmvb vob ogv asf f4v divx)
+FIND_ARGS=()
+for e in "${EXTS[@]}"; do
+    FIND_ARGS+=(-o -iname "*.$e")
+done
+FIND_ARGS=("${FIND_ARGS[@]:1}")
+
+echo "扫描目录: ${INPUT_DIR}（不含子文件夹）"
+echo "输出目录: $OUTPUT_DIR"
+echo "-----------------------------------------"
+
+total=0; ok=0; fail=0; skip=0; sub_fallback=0
+
+while IFS= read -r -d '' f; do
+    total=$((total + 1))
+    name="$(basename "$f")"
+    out="$OUTPUT_DIR/${name%.*}.mp4"
+
+    # 输入输出为同一目录时，避免自我覆盖
+    if [ "$out" -ef "$f" ]; then
+        out="$OUTPUT_DIR/${name%.*}_converted.mp4"
+    fi
+
+    if [ -e "$out" ]; then
+        echo "↷ [$total] 跳过（输出已存在）: ${out##*/}"
+        printf '跳过  %s\n' "${out##*/}" >> "$RESULT_FILE"
+        skip=$((skip + 1))
+        continue
+    fi
+
+    echo "▶ [$total] 转换: $name"
+
+    if encode_file "$f" "$out" 1; then
+        echo "✅ 完成: ${out##*/}"
+        printf '成功  %s\n' "${out##*/}" >> "$RESULT_FILE"
+        ok=$((ok + 1))
+    else
+        rm -f "$out"
+        # 字幕无法写入 MP4（如源文件其实不是 MP4）时，回退为无字幕版本，保住视频
+        if encode_file "$f" "$out" 0; then
+            echo "⚠ 字幕无法原样写入 MP4，已输出无字幕版本: ${out##*/}"
+            printf '成功  %s（字幕回退）\n' "${out##*/}" >> "$RESULT_FILE"
+            ok=$((ok + 1))
+            sub_fallback=$((sub_fallback + 1))
+        else
+            echo "❌ 失败: $name"
+            printf '失败  %s\n' "$name" >> "$RESULT_FILE"
+            rm -f "$out"
+            fail=$((fail + 1))
+        fi
+    fi
+done < <(find "$INPUT_DIR" -maxdepth 1 -type f \( "${FIND_ARGS[@]}" \) -print0)
+
+# ---------- 3. 汇总并弹窗显示结果 ----------
+echo "-----------------------------------------"
+summary_suffix=""
+if [ "$sub_fallback" -gt 0 ]; then
+    summary_suffix="（字幕回退 $sub_fallback 个）"
+fi
+echo "全部结束: 共 ${total} 个，成功 ${ok}，失败 ${fail}，跳过 ${skip}${summary_suffix}"
+
+if [ "$total" -eq 0 ]; then
+    osascript -e "display dialog \"在输入目录中未找到视频文件：\n$INPUT_DIR\" with title \"转换结果\" buttons {\"好的\"} default button 1 with icon caution"
+    exit 0
+fi
+
+{
+    echo "共 ${total} 个视频｜成功 ${ok}｜失败 ${fail}｜跳过 ${skip}${summary_suffix}"
+    echo "输出目录: $OUTPUT_DIR"
+    echo "――――――――――――――――――"
+    head -n 40 "$RESULT_FILE"
+    lines=$(wc -l < "$RESULT_FILE" | tr -d ' ')
+    if [ "$lines" -gt 40 ]; then
+        echo "…其余 $((lines - 40)) 条结果见终端输出"
+    fi
+} > "$DIALOG_FILE"
+
+osascript <<EOF
+set f to POSIX file "$DIALOG_FILE"
+set dialogText to read f as «class utf8»
+set userChoice to button returned of (display dialog dialogText with title "视频转换结果" buttons {"打开输出文件夹", "好的"} default button 2 with icon note)
+if userChoice is "打开输出文件夹" then
+    do shell script "open " & quoted form of "$OUTPUT_DIR"
+end if
+EOF
